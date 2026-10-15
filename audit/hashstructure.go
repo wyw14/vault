@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/hashicorp/go-secure-stdlib/strutil"
@@ -77,6 +79,13 @@ func hashRequest(ctx context.Context, salter Salter, req *request, hmacAccessor 
 	}
 
 	if req.Data != nil {
+		// Binary request bodies arrive as byte slices and would be silently
+		// base64 encoded by the JSON encoder, bypassing HMAC. Convert to string
+		// before hashing, mirroring the response handling.
+		if b, ok := req.Data[logical.HTTPRawBody].([]byte); ok {
+			req.Data[logical.HTTPRawBody] = string(b)
+		}
+
 		err = hashMap(fn, req.Data, nonHMACDataKeys)
 		if err != nil {
 			return err
@@ -195,6 +204,20 @@ func hashStructure(s interface{}, cb hashCallback, ignoredKeys []string) error {
 // a value.
 type hashCallback func(string) string
 
+// hashKeyEntry records a single position on the hashWalker key stack.
+// Map values carry the name of the enclosing map key; slice/array elements
+// have no map key of their own, so they must not inherit the containing
+// key's exemption (otherwise a whitelisted container key would keep its
+// entire subtree in cleartext).
+type hashKeyEntry struct {
+	// name is the map key at this position. Only meaningful when sliceElem
+	// is false.
+	name string
+
+	// sliceElem is true when the position is an element of a slice/array.
+	sliceElem bool
+}
+
 // hashWalker implements interfaces for the reflectwalk package
 // (github.com/mitchellh/reflectwalk) that can be used to automatically
 // replace primitives with a hashed value.
@@ -207,11 +230,13 @@ type hashWalker struct {
 	// IgnoreKeys are the keys that won't have the hashCallback applied
 	IgnoredKeys []string
 
-	// MapElem appends the key itself (not the reflect.Value) to key.
+	// MapElem appends the enclosing map key (not the reflect.Value) to key.
 	// The last element in key is the most recently entered map key.
 	// Since Exit pops the last element of key, only nesting to another
 	// structure increases the size of this slice.
-	key []string
+	// SliceElem appends a marker so that values nested within slice
+	// elements can't inherit the containing map key's exemption.
+	key []hashKeyEntry
 
 	lastValue reflect.Value
 
@@ -236,6 +261,10 @@ type hashWalker struct {
 // Now() or Unix().
 var hashTimeType = reflect.TypeOf(time.Time{})
 
+// rawMessageType stores the reflect.Type for json.RawMessage; pre-serialized
+// JSON must be emitted verbatim rather than treated as a binary value.
+var rawMessageType = reflect.TypeOf(json.RawMessage(nil))
+
 func (w *hashWalker) Enter(loc reflectwalk.Location) error {
 	w.loc = append(w.loc, loc)
 	return nil
@@ -253,6 +282,7 @@ func (w *hashWalker) Exit(loc reflectwalk.Location) error {
 	case reflectwalk.Slice:
 		w.cs = w.cs[:len(w.cs)-1]
 	case reflectwalk.SliceElem:
+		w.key = w.key[:len(w.key)-1]
 		w.csKey = w.csKey[:len(w.csKey)-1]
 	}
 
@@ -266,18 +296,60 @@ func (w *hashWalker) Map(m reflect.Value) error {
 
 func (w *hashWalker) MapElem(m, k, v reflect.Value) error {
 	w.csKey = append(w.csKey, k)
-	w.key = append(w.key, k.String())
+	w.key = append(w.key, hashKeyEntry{name: k.String()})
 	w.lastValue = v
 	return nil
 }
 
+// Slice intercepts byte slices so binary data can't bypass HMAC by being
+// base64 encoded by the JSON serializer. Non-byte slices are walked as
+// normal (their elements are not exempted just because the containing
+// map key is whitelisted).
 func (w *hashWalker) Slice(s reflect.Value) error {
 	w.cs = append(w.cs, s)
+
+	if s.Type().Elem().Kind() != reflect.Uint8 {
+		return nil
+	}
+
+	// json.RawMessage is already serialized JSON and must be emitted as-is,
+	// otherwise the embedded JSON would itself be quoted and HMAC'd.
+	if s.Type() == rawMessageType {
+		return nil
+	}
+
+	// Bytes() works for both []byte and named byte-slice types whose
+	// underlying type is uint8.
+	b := s.Bytes()
+
+	replaceVal, _, err := w.hashValue(string(b))
+	if err != nil {
+		return err
+	}
+
+	// Replace the whole byte slice at its containing location (a map
+	// value or a slice element, at any nesting depth); s itself is not
+	// guaranteed to be addressable. The immediate container is the
+	// second-to-top container stack entry (the top entry is this byte
+	// slice itself).
+	if len(w.cs) >= 2 {
+		container := w.cs[len(w.cs)-2]
+		containerKey := w.csKey[len(w.csKey)-1]
+		switch container.Kind() {
+		case reflect.Map:
+			container.SetMapIndex(containerKey, reflect.ValueOf(replaceVal))
+		case reflect.Slice, reflect.Array:
+			si := int(containerKey.Int())
+			container.Slice(si, si+1).Index(0).Set(reflect.ValueOf(replaceVal))
+		}
+	}
+
 	return nil
 }
 
 func (w *hashWalker) SliceElem(i int, elem reflect.Value) error {
 	w.csKey = append(w.csKey, reflect.ValueOf(i))
+	w.key = append(w.key, hashKeyEntry{sliceElem: true})
 	return nil
 }
 
@@ -327,6 +399,61 @@ func (w *hashWalker) StructField(reflect.StructField, reflect.Value) error {
 	return nil
 }
 
+// currentMapKey returns the name of the nearest enclosing map key for the
+// walker's current position, and true. It returns false when the value is (or
+// is nested within) a slice/array element: such values have no map key of
+// their own, so a whitelisted container key never exempts them.
+func (w *hashWalker) currentMapKey() (string, bool) {
+	for i := len(w.key) - 1; i >= 0; i-- {
+		if w.key[i].sliceElem {
+			return "", false
+		}
+		if w.key[i].name != "" {
+			return w.key[i].name, true
+		}
+	}
+	return "", false
+}
+
+// hashValue applies the hash callback to the supplied value unless its own
+// map key is whitelisted. Values inside slice/array elements are always hashed.
+func (w *hashWalker) hashValue(s string) (string, bool, error) {
+	if w.Callback == nil {
+		return s, false, nil
+	}
+
+	if currentKey, ok := w.currentMapKey(); ok && strutil.StrListContains(w.IgnoredKeys, currentKey) {
+		return s, true, nil
+	}
+
+	return w.Callback(s), false, nil
+}
+
+// replaceValue stores the supplied replacement value at the walker's current
+// location (map value or slice element), or directly on an addressable value.
+func (w *hashWalker) replaceValue(resultVal reflect.Value) error {
+	switch w.loc[len(w.loc)-1] {
+	case reflectwalk.MapValue:
+		// If we're in a map, then the only way to set a map value is
+		// to set it directly.
+		m := w.cs[len(w.cs)-1]
+		mk := w.csKey[len(w.csKey)-1]
+		m.SetMapIndex(mk, resultVal)
+	case reflectwalk.SliceElem:
+		s := w.cs[len(w.cs)-1]
+		si := int(w.csKey[len(w.csKey)-1].Int())
+		s.Slice(si, si+1).Index(0).Set(resultVal)
+	default:
+		// Otherwise, we should be addressable
+		if !w.lastValue.CanSet() {
+			return nil
+		}
+		w.lastValue.Set(resultVal)
+	}
+
+	return nil
+}
+
 // Primitive calls Callback to transform strings in-place, except for map keys.
 // Strings hiding within interfaces are also transformed.
 func (w *hashWalker) Primitive(v reflect.Value) error {
@@ -349,13 +476,10 @@ func (w *hashWalker) Primitive(v reflect.Value) error {
 		return nil
 	}
 
-	// See if the current key is part of the ignored keys
-	currentKey := w.key[len(w.key)-1]
-	if strutil.StrListContains(w.IgnoredKeys, currentKey) {
-		return nil
+	replaceVal, _, err := w.hashValue(v.String())
+	if err != nil {
+		return err
 	}
-
-	replaceVal := w.Callback(v.String())
 
 	resultVal := reflect.ValueOf(replaceVal)
 	switch w.loc[len(w.loc)-1] {
@@ -367,7 +491,7 @@ func (w *hashWalker) Primitive(v reflect.Value) error {
 		m.SetMapIndex(mk, resultVal)
 	case reflectwalk.SliceElem:
 		s := w.cs[len(w.cs)-1]
-		si := int(w.csKey[len(w.cs)-1].Int())
+		si := int(w.csKey[len(w.csKey)-1].Int())
 		s.Slice(si, si+1).Index(0).Set(resultVal)
 	default:
 		// Otherwise, we should be addressable
@@ -375,4 +499,157 @@ func (w *hashWalker) Primitive(v reflect.Value) error {
 	}
 
 	return nil
+}
+
+// minErrorRedactionValueLength is the shortest scalar value that will be
+// redacted from an error message. Shorter values (single characters and the
+// like) are far more likely to corrupt readable failure reasons than to be
+// actual secrets.
+const minErrorRedactionValueLength = 3
+
+// redactErrorString replaces every secret scalar value that appears within an
+// audit entry's failure reason (request parameters and response values that
+// would otherwise be HMAC'd, plus tokens/accessors) with its digest. Values
+// whitelisted by their containing map key remain readable, so the failure
+// reason stays human-readable; only raw secret content is masked.
+func redactErrorString(ctx context.Context, salter Salter, msg string, in *logical.LogInput, hmacAccessor bool) (string, error) {
+	if msg == "" || in == nil {
+		return msg, nil
+	}
+
+	salt, err := salter.Salt(ctx)
+	if err != nil {
+		return "", err
+	}
+	fn := salt.GetIdentifiedHMAC
+
+	// raw -> digest replacements.
+	replacements := make(map[string]string)
+
+	addSecret := func(raw string) {
+		if len(raw) < minErrorRedactionValueLength {
+			return
+		}
+		if _, ok := replacements[raw]; !ok {
+			replacements[raw] = fn(raw)
+		}
+	}
+
+	// Tokens are always secret, regardless of configuration; accessors are
+	// only HMAC'd when the device is configured to do so.
+	if in.Request != nil {
+		addSecret(in.Request.ClientToken)
+		if hmacAccessor {
+			addSecret(in.Request.ClientTokenAccessor)
+		}
+	}
+	if in.Auth != nil {
+		addSecret(in.Auth.ClientToken)
+		if hmacAccessor {
+			addSecret(in.Auth.Accessor)
+		}
+	}
+	if in.Response != nil {
+		if in.Response.Auth != nil {
+			addSecret(in.Response.Auth.ClientToken)
+			if hmacAccessor {
+				addSecret(in.Response.Auth.Accessor)
+			}
+		}
+		if in.Response.WrapInfo != nil {
+			addSecret(in.Response.WrapInfo.Token)
+			if hmacAccessor {
+				addSecret(in.Response.WrapInfo.WrappedAccessor)
+				addSecret(in.Response.WrapInfo.Accessor)
+			}
+		}
+	}
+
+	// Scalar data values that would otherwise be hashed are masked within
+	// the failure reason; whitelisted key values stay readable. This is a
+	// read-only traversal: it must never mutate the supplied LogInput data.
+	var collectValue func(value interface{}, keyIgnored bool)
+	collectMap := func(data map[string]interface{}, nonHMACKeys []string) {
+		for k, v := range data {
+			collectValue(v, strutil.StrListContains(nonHMACKeys, k))
+		}
+	}
+	collectStringMap := func(data map[string]string, nonHMACKeys []string) {
+		for k, v := range data {
+			collectValue(v, strutil.StrListContains(nonHMACKeys, k))
+		}
+	}
+	collectValue = func(value interface{}, keyIgnored bool) {
+		switch vv := value.(type) {
+		case string:
+			if !keyIgnored {
+				addSecret(vv)
+			}
+		case []byte:
+			// Pre-serialized JSON stays as-is; all other binary values
+			// follow the same rule as the text of the same field.
+			if _, ok := value.(json.RawMessage); !ok {
+				if !keyIgnored {
+					addSecret(string(vv))
+				}
+			}
+		case map[string]interface{}:
+			collectMap(vv, nil)
+		case map[string]string:
+			collectStringMap(vv, nil)
+		case []interface{}:
+			for _, v := range vv {
+				// Slice/array elements have no map key of their own, so
+				// a container key exemption never applies to them.
+				collectValue(v, false)
+			}
+		case []string:
+			for _, v := range vv {
+				collectValue(v, false)
+			}
+		default:
+			// Other kinds (numbers, booleans, structs, ...) can't be
+			// reliably located inside a free-form error message.
+		}
+	}
+	collect := collectMap
+
+	if in.Request != nil {
+		collect(in.Request.Data, in.NonHMACReqDataKeys)
+	}
+	if in.Response != nil {
+		collect(in.Response.Data, in.NonHMACRespDataKeys)
+		collect(in.Response.SupplementalAuditResponseData, in.NonHMACRespDataKeys)
+		collect(in.Response.SupplementalAuditRequestData, in.NonHMACReqDataKeys)
+	}
+
+	if len(replacements) == 0 {
+		return msg, nil
+	}
+
+	// Replace longest values first so that overlapping values (e.g. "bar"
+	// and "barbell") don't leave one partially substituted.
+	values := make([]string, 0, len(replacements))
+	for raw := range replacements {
+		values = append(values, raw)
+	}
+	sort.Slice(values, func(i, j int) bool {
+		return len(values[i]) > len(values[j])
+	})
+
+	pairs := make([]string, 0, 2*len(values))
+	for _, raw := range values {
+		// A value that is already an HMAC digest needs no replacement, and
+		// substituting would only corrupt it.
+		digest := replacements[raw]
+		if raw == digest {
+			continue
+		}
+		pairs = append(pairs, raw, digest)
+	}
+	if len(pairs) > 0 {
+		return strings.NewReplacer(pairs...).Replace(msg), nil
+	}
+
+	return msg, nil
 }

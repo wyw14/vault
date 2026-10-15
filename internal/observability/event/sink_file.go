@@ -6,6 +6,7 @@ package event
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -227,13 +228,37 @@ func (s *FileSink) log(ctx context.Context, data []byte) error {
 		return fmt.Errorf("unable to open file for sink %q: %w", s.path, err)
 	}
 
-	if _, err := reader.WriteTo(s.file); err == nil {
+	n, writeErr := reader.WriteTo(s.file)
+	if writeErr == nil {
 		return nil
 	}
 
-	// Otherwise, opportunistically try to re-open the FD, once per call (1 retry attempt).
+	if n > 0 {
+		// Part of the record was already written. Re-trying (below or on
+		// the next event) would duplicate this record, and leaving the
+		// dangling prefix would corrupt the next record by concatenating
+		// the two lines. Terminate the partial line, drop the stale file
+		// handle (the next event re-opens it) and report the failure rather
+		// than silently producing a half record.
+		if s.logger != nil {
+			s.logger.Error("file sink partial write",
+				"path", s.path,
+				"bytes_written", n,
+				"bytes_total", len(data),
+				"error", writeErr)
+		}
+		_, _ = s.file.Write([]byte("\n"))
+		_ = s.file.Close()
+		s.file = nil
+		return fmt.Errorf("unable to fully write to file for sink %q (%d of %d bytes written): %w", s.path, n, len(data), writeErr)
+	}
+
+	// Nothing was written, so the failure is likely a stale/broken file
+	// descriptor. Opportunistically try to re-open the FD, once per call
+	// (1 retry attempt); nothing needs rolling back. An already closed
+	// descriptor is the expected failure mode here.
 	err := s.file.Close()
-	if err != nil {
+	if err != nil && !errors.Is(err, os.ErrClosed) {
 		return fmt.Errorf("unable to close file for sink %q: %w", s.path, err)
 	}
 

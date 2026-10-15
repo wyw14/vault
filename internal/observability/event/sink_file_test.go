@@ -4,10 +4,14 @@
 package event
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -331,6 +335,82 @@ func TestFileSink_log_cancelledContext(t *testing.T) {
 
 	// We expect that the error now has context cancelled in it.
 	require.True(t, errors.Is(err, context.Canceled))
+}
+
+// TestFileSink_log_reopenRetry verifies that when the first write of a
+// record fails before any byte lands (e.g. a stale file descriptor), the
+// record is re-written exactly once after reopening, so the file contains
+// no partial or duplicated entry.
+func TestFileSink_log_reopenRetry(t *testing.T) {
+	tempPath := filepath.Join(t.TempDir(), "juan.log")
+	data := []byte(`{"event": "retry-once"}` + "\n")
+
+	sink, err := NewFileSink(tempPath, "json")
+	require.NoError(t, err)
+	require.NotNil(t, sink)
+
+	// Close the file descriptor out from under the sink without nilling it,
+	// so the initial write fails cleanly and triggers the single retry.
+	require.NoError(t, sink.file.Close())
+
+	require.NoError(t, sink.log(context.Background(), data))
+
+	contents, err := os.ReadFile(tempPath)
+	require.NoError(t, err)
+	require.Equal(t, data, contents)
+
+	// Release the (re-opened) descriptor before temp-dir cleanup.
+	require.NoError(t, sink.file.Close())
+}
+
+// TestFileSink_log_concurrentWrites verifies that the single-permit pool
+// serializes concurrent writes per sink: every record lands exactly once,
+// whole, and in a valid JSON line.
+func TestFileSink_log_concurrentWrites(t *testing.T) {
+	tempPath := filepath.Join(t.TempDir(), "juan.log")
+
+	sink, err := NewFileSink(tempPath, "json")
+	require.NoError(t, err)
+	require.NotNil(t, sink)
+	// Close the descriptor before temp-dir cleanup runs, since Windows
+	// refuses to unlink open files.
+	t.Cleanup(func() {
+		_ = sink.file.Close()
+	})
+
+	const goroutines = 8
+	const perGoroutine = 25
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < perGoroutine; i++ {
+				line := fmt.Sprintf(`{"goroutine":%d,"index":%d}`+"\n", g, i)
+				require.NoError(t, sink.log(context.Background(), []byte(line)))
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	f, err := os.Open(tempPath)
+	require.NoError(t, err)
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	seen := make(map[string]struct{}, goroutines*perGoroutine)
+	for scanner.Scan() {
+		line := scanner.Text()
+		parsed := make(map[string]int)
+		require.NoError(t, json.Unmarshal([]byte(line), &parsed), "malformed JSON line: %q", line)
+		require.Len(t, parsed, 2)
+		marker := fmt.Sprintf("%d/%d", parsed["goroutine"], parsed["index"])
+		_, ok := seen[marker]
+		require.False(t, ok, "duplicate record: %q", marker)
+		seen[marker] = struct{}{}
+	}
+	require.NoError(t, scanner.Err())
+	require.Len(t, seen, goroutines*perGoroutine)
 }
 
 // TestFileSink_log_timeoutWhileWaitingForPermit verifies that log returns

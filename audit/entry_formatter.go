@@ -694,5 +694,16 @@ func (f *entryFormatter) createEntry(ctx context.Context, a *Event) (*entry, err
 		}
 	}
 
+	// The failure reason is embedded verbatim in the entry; redact any secret
+	// request parameter/response values (or tokens) it happens to contain,
+	// honoring the same whitelist rules. The reason itself stays readable.
+	// Raw audit output is intentionally unmasked.
+	if entry.Error != "" && !f.config.raw {
+		entry.Error, err = redactErrorString(ctx, f.salter, entry.Error, data, f.config.hmacAccessor)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	return entry, nil
 }

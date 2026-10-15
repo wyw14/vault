@@ -2062,5 +2062,90 @@ type staticSalt struct {
 
 // Salt returns the static salt and no error.
 func (s *staticSalt) Salt(_ context.Context) (*salt.Salt, error) {
-	return s.salt, nil
+        return s.salt, nil
+}
+
+// TestEntryFormatter_Process_FailedResponse ensures failed requests obey the
+// same masking rules as successful ones: the failure reason stays readable,
+// but any request parameter or secret it echoes is masked (whitelisted
+// fields excepted), and request data itself is still fully hashed.
+func TestEntryFormatter_Process_FailedResponse(t *testing.T) {
+	t.Parallel()
+
+	ss := newStaticSalt(t)
+	barHMAC := ss.salt.GetIdentifiedHMAC("secret-val")
+	bazRaw := "baz"
+	clientTokenHMAC := ss.salt.GetIdentifiedHMAC("client-token")
+
+	cfg, err := newFormatterConfig(&testHeaderFormatter{}, map[string]string{"hmac_accessor": "false"})
+	require.NoError(t, err)
+	f, err := newEntryFormatter("juan", cfg, ss, hclog.NewNullLogger())
+	require.NoError(t, err)
+
+	in := &logical.LogInput{
+		Auth: &logical.Auth{
+			ClientToken: "client-token",
+			TokenType:    logical.TokenTypeService,
+		},
+		Request: &logical.Request{
+			Operation:  logical.UpdateOperation,
+			Path:       "kv/data/secret",
+			Connection: &logical.Connection{RemoteAddr: "127.0.0.1"},
+			Data: map[string]interface{}{
+				"baz":      bazRaw,
+				"password": "secret-val",
+			},
+		},
+		OuterErr:            errors.New(`permission denied for password "secret-val"`),
+		NonHMACReqDataKeys:  []string{"baz"},
+	}
+
+	process := func(st subtype) *entry {
+		t.Helper()
+
+		a, err := newEvent(st)
+		require.NoError(t, err)
+		a.Data = in
+		a.setTimeProvider(&testTimeProvider{})
+
+		e := &eventlogger.Event{
+			Type:      event.AuditType.AsEventType(),
+			CreatedAt: time.Now(),
+			Formatted: make(map[string][]byte),
+			Payload:   a,
+		}
+
+		e2, err := f.Process(nshelper.RootContext(context.Background()), e)
+		require.NoError(t, err)
+
+		b, ok := e2.Format(jsonFormat.String())
+		require.True(t, ok)
+
+		out := new(entry)
+		require.NoError(t, json.Unmarshal(b, out))
+		return out
+	}
+
+	// Response event for a failed request: the response is nil, but the
+	// request data and the failure reason are still recorded.
+	out := process(ResponseType)
+	require.Nil(t, out.Response)
+	require.Contains(t, out.Error, "permission denied")
+	require.Contains(t, out.Error, barHMAC)
+	require.NotContains(t, out.Error, "secret-val")
+	require.NotContains(t, out.Error, "client-token")
+
+	require.Equal(t, clientTokenHMAC, out.Auth.ClientToken)
+	require.Equal(t, bazRaw, out.Request.Data["baz"])
+	require.Equal(t, barHMAC, out.Request.Data["password"])
+
+	// The request event for the same failure obeys the same rules.
+	reqOut := process(RequestType)
+	require.Contains(t, reqOut.Error, "permission denied")
+	require.Contains(t, reqOut.Error, barHMAC)
+	require.NotContains(t, reqOut.Error, "secret-val")
+	require.NotContains(t, reqOut.Error, "client-token")
+	require.Equal(t, clientTokenHMAC, reqOut.Auth.ClientToken)
+	require.Equal(t, bazRaw, reqOut.Request.Data["baz"])
+	require.Equal(t, barHMAC, reqOut.Request.Data["password"])
 }

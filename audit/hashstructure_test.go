@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"testing"
 	"time"
@@ -499,4 +500,296 @@ func TestHashRequest_EnterpriseTokenFieldsInMetadata(t *testing.T) {
 	require.Equal(t, "txn-hash-1", auditAuth.Metadata["enterprise_token_transaction"])
 	require.Equal(t, "actor-123", auditAuth.Metadata["actor_entity_id"])
 	require.Equal(t, "actor-service", auditAuth.Metadata["actor_entity_name"])
+}
+
+// hmacForTest returns the identified HMAC of s using the trivial test salter.
+func hmacForTest(t *testing.T, s string) string {
+	t.Helper()
+	out, err := hashString(context.Background(), &testSalter{}, s)
+	require.NoError(t, err)
+	return out
+}
+
+// TestHashWalker_WhitelistNested ensures whitelisting is decided by a field's
+// own map key regardless of nesting depth: the same field name at the top
+// level and inside nested objects is treated identically, while a
+// whitelisted container key keeps no exemption for its sub-tree (its
+// children are still hashed unless their own key is whitelisted),
+// including bare elements of arrays/slices.
+func TestHashWalker_WhitelistNested(t *testing.T) {
+	vHMAC := hmacForTest(t, "v")
+	xHMAC := hmacForTest(t, "x")
+	sHMAC := hmacForTest(t, "s")
+	qHMAC := hmacForTest(t, "q")
+
+	data := map[string]interface{}{
+		// Same key name at the top level and deep inside nested structures:
+		// whitelisted everywhere it appears.
+		"foo": "bar",
+		"nested": map[string]interface{}{
+			"foo":    "baz",
+			"secret": "v",
+		},
+		// Bare array elements have no field name of their own, so they are
+		// never exempted by a whitelisted container key; maps inside arrays
+		// still resolve by their own keys.
+		"list": []interface{}{
+			"x",
+			map[string]interface{}{
+				"foo":    "z",
+				"secret": "q",
+			},
+		},
+		// "container" is whitelisted, but neither its nested map values nor
+		// its array elements inherit the exemption.
+		"container": map[string]interface{}{
+			"secret": "s",
+		},
+		"items": []interface{}{"q"},
+	}
+
+	err := hashStructure(data, (&testSalter{}).mustGetIdentifiedHMAC(t), []string{"foo", "container", "items"})
+	require.NoError(t, err)
+
+	require.Equal(t, "bar", data["foo"])
+	nested := data["nested"].(map[string]interface{})
+	require.Equal(t, "baz", nested["foo"])
+	require.Equal(t, vHMAC, nested["secret"])
+
+	list := data["list"].([]interface{})
+	require.Equal(t, xHMAC, list[0])
+	listMap := list[1].(map[string]interface{})
+	require.Equal(t, "z", listMap["foo"])
+	require.Equal(t, qHMAC, listMap["secret"])
+
+	container := data["container"].(map[string]interface{})
+	require.Equal(t, sHMAC, container["secret"])
+
+	items := data["items"].([]interface{})
+	require.Equal(t, qHMAC, items[0])
+}
+
+// TestHashWalker_BinaryValues ensures binary values are normalised to strings
+// and HMAC'd (rather than leaking through JSON base64 encoding) at every
+// nesting position, while pre-serialized JSON is left untouched and
+// namedBytes is a named byte-slice type, as produced by plugins.
+type namedBytes []byte
+
+// whitelisted binary fields remain readable.
+func TestHashWalker_BinaryValues(t *testing.T) {
+	raw := []byte{0x00, 0x01, 0x02, 'b', 'i', 'n'}
+	rawHMAC := hmacForTest(t, string(raw))
+	readable := []byte("readable-binary")
+	ptr := &raw
+
+	data := map[string]interface{}{
+		"blob":    raw,
+		"named":   namedBytes(raw),
+		"nested":  map[string]interface{}{"blob2": raw},
+		"list":    []interface{}{raw},
+		"rawmsg":  json.RawMessage(`{"k":"v"}`),
+		"safe":    readable,
+		// Pointers to byte slices are binary just like byte slices.
+		"blobptr": ptr,
+		// Bare elements of a whitelisted slice are still hashed: a
+		// container key exemption never reaches slice elements.
+		"safeList": []string{"e"},
+	}
+
+	err := hashStructure(data, (&testSalter{}).mustGetIdentifiedHMAC(t), []string{"safe", "safeList"})
+	require.NoError(t, err)
+
+	require.Equal(t, rawHMAC, data["blob"])
+	require.Equal(t, rawHMAC, data["named"])
+	require.Equal(t, rawHMAC, data["nested"].(map[string]interface{})["blob2"])
+	require.Equal(t, rawHMAC, data["list"].([]interface{})[0])
+	// The whole pointer value was replaced by its hashed string.
+	require.Equal(t, hmacForTest(t, string(raw)), data["blobptr"])
+
+	// json.RawMessage stays embedded JSON, not a quoted digest string.
+	require.Equal(t, json.RawMessage(`{"k":"v"}`), data["rawmsg"])
+
+	// Whitelisted binary is readable as its original text content.
+	require.Equal(t, "readable-binary", data["safe"])
+	// Slice elements are never exempted by a whitelisted container key.
+	require.Equal(t, hmacForTest(t, "e"), data["safeList"].([]string)[0])
+}
+
+// TestHashRequest_HTTPRawBodyBinary ensures a request's binary raw body is
+// converted to a string and hashed exactly like a response raw body, rather
+// than leaking through JSON base64 encoding.
+func TestHashRequest_HTTPRawBodyBinary(t *testing.T) {
+	body := []byte{0x00, 'b', 'o', 'd', 'y'}
+	bodyHMAC := hmacForTest(t, string(body))
+	barHMAC := hmacForTest(t, "bar")
+
+	req, err := newRequest(&logical.Request{
+		Data: map[string]interface{}{
+			logical.HTTPRawBody: body,
+			"foo":               "bar",
+		},
+	}, nshelper.RootNamespace)
+	require.NoError(t, err)
+
+	err = hashRequest(context.Background(), &testSalter{}, req, false, nil)
+	require.NoError(t, err)
+
+	require.Equal(t, bodyHMAC, req.Data[logical.HTTPRawBody])
+	require.Equal(t, barHMAC, req.Data["foo"])
+
+	// A whitelisted raw body stays readable.
+	req2, err := newRequest(&logical.Request{
+		Data: map[string]interface{}{
+			logical.HTTPRawBody: body,
+		},
+	}, nshelper.RootNamespace)
+	require.NoError(t, err)
+	err = hashRequest(context.Background(), &testSalter{}, req2, false, []string{logical.HTTPRawBody})
+	require.NoError(t, err)
+	require.Equal(t, string(body), req2.Data[logical.HTTPRawBody])
+}
+
+// mustGetIdentifiedHMAC returns the identified HMAC function for the salter.
+func (s *testSalter) mustGetIdentifiedHMAC(t *testing.T) hashCallback {
+	t.Helper()
+	salt, err := s.Salt(context.Background())
+	require.NoError(t, err)
+	return salt.GetIdentifiedHMAC
+}
+
+// TestRedactErrorString ensures the failure reason embedded in an audit entry
+// stays readable while any secret request parameter / response value (or
+// token) the message contains is replaced by its digest; whitelisted values
+// stay readable.
+func TestRedactErrorString(t *testing.T) {
+	ctx := context.Background()
+	salter := &testSalter{}
+
+	cases := map[string]struct {
+		Msg          string
+		Input        *logical.LogInput
+		HMACAccessor bool
+		Expected     string
+	}{
+		"plain-reason-unchanged": {
+			Msg:      "permission denied",
+			Input:    &logical.LogInput{Request: &logical.Request{Data: map[string]interface{}{"foo": "bar"}}},
+			Expected: "permission denied",
+		},
+		"request-value-redacted": {
+			Msg:      `invalid value supplied: "bar"`,
+			Input:    &logical.LogInput{Request: &logical.Request{Data: map[string]interface{}{"foo": "bar"}}},
+			Expected: fmt.Sprintf(`invalid value supplied: %q`, hmacForTest(t, "bar")),
+		},
+		"whitelisted-value-readable": {
+			Msg:      `invalid value supplied: "bar"`,
+			Input:    &logical.LogInput{Request: &logical.Request{Data: map[string]interface{}{"foo": "bar"}}},
+			Expected: `invalid value supplied: "bar"`,
+		},
+		"nested-value-redacted": {
+			Msg: `invalid nested: "deep"`,
+			Input: &logical.LogInput{Request: &logical.Request{Data: map[string]interface{}{
+				"outer": map[string]interface{}{"k": "deep"},
+			}}},
+			Expected: fmt.Sprintf(`invalid nested: %q`, hmacForTest(t, "deep")),
+		},
+		"binary-value-redacted": {
+			Msg:      `bad payload: "bin-body"`,
+			Input: &logical.LogInput{Request: &logical.Request{Data: map[string]interface{}{
+				"blob": []byte("bin-body"),
+			}}},
+			Expected: fmt.Sprintf(`bad payload: %q`, hmacForTest(t, "bin-body")),
+		},
+		"slice-element-value-redacted": {
+			Msg: `bad element: "slice-val"`,
+			Input: &logical.LogInput{Request: &logical.Request{Data: map[string]interface{}{
+				"list": []interface{}{"slice-val"},
+			}}},
+			Expected: fmt.Sprintf(`bad element: %q`, hmacForTest(t, "slice-val")),
+		},
+		"response-value-redacted": {
+			Msg: `processing failed: "resp-secret"`,
+			Input: &logical.LogInput{
+				Request:  &logical.Request{},
+				Response: &logical.Response{Data: map[string]interface{}{"foo": "resp-secret"}},
+			},
+			Expected: fmt.Sprintf(`processing failed: %q`, hmacForTest(t, "resp-secret")),
+		},
+		"client-token-redacted": {
+			Msg:      "token rejected: client-tok",
+			Input:    &logical.LogInput{Auth: &logical.Auth{ClientToken: "client-tok"}, Request: &logical.Request{}},
+			Expected: "token rejected: " + hmacForTest(t, "client-tok"),
+		},
+		"request-token-redacted": {
+			Msg:      "token rejected: request-tok",
+			Input:    &logical.LogInput{Request: &logical.Request{ClientToken: "request-tok"}},
+			Expected: "token rejected: " + hmacForTest(t, "request-tok"),
+		},
+		"wrap-token-redacted": {
+			Msg: "wrap failed: wrap-tok",
+			Input: &logical.LogInput{
+				Request:  &logical.Request{},
+				Response: &logical.Response{WrapInfo: &wrapping.ResponseWrapInfo{Token: "wrap-tok"}},
+			},
+			Expected: "wrap failed: " + hmacForTest(t, "wrap-tok"),
+		},
+		"accessor-redacted-when-enabled": {
+			Msg:           "accessor bad: accessor-tok",
+			Input:         &logical.LogInput{Auth: &logical.Auth{Accessor: "accessor-tok"}, Request: &logical.Request{}},
+			HMACAccessor:  true,
+			Expected:      "accessor bad: " + hmacForTest(t, "accessor-tok"),
+		},
+		"accessor-readable-when-disabled": {
+			Msg:           "accessor bad: accessor-tok",
+			Input:         &logical.LogInput{Auth: &logical.Auth{Accessor: "accessor-tok"}, Request: &logical.Request{}},
+			HMACAccessor:  false,
+			Expected:      "accessor bad: accessor-tok",
+		},
+		"short-value-untouched": {
+			Msg:      `x is bad`,
+			Input: &logical.LogInput{Request: &logical.Request{Data: map[string]interface{}{"foo": "x"}}},
+			Expected: `x is bad`,
+		},
+		"empty-message": {
+			Msg:      "",
+			Input:    &logical.LogInput{Request: &logical.Request{}},
+			Expected: "",
+		},
+	}
+
+	for name, tc := range cases {
+		name := name
+		tc := tc
+		t.Run(name, func(t *testing.T) {
+			if name == "whitelisted-value-readable" {
+				// Exercise the request whitelist for this single case.
+				tc.Input.NonHMACReqDataKeys = []string{"foo"}
+			}
+
+			// Snapshot the request/response data to prove redaction never
+			// mutates the caller's input.
+			var reqData map[string]interface{}
+			if tc.Input.Request != nil && tc.Input.Request.Data != nil {
+				reqData = make(map[string]interface{}, len(tc.Input.Request.Data))
+				for k, v := range tc.Input.Request.Data {
+					reqData[k] = v
+				}
+			}
+			var respData map[string]interface{}
+			if tc.Input.Response != nil && tc.Input.Response.Data != nil {
+				respData = tc.Input.Response.Data
+			}
+
+			got, err := redactErrorString(ctx, salter, tc.Msg, tc.Input, tc.HMACAccessor)
+			require.NoError(t, err)
+			require.Equal(t, tc.Expected, got)
+
+			if tc.Input.Request != nil {
+				require.Equal(t, reqData, tc.Input.Request.Data)
+			}
+			if respData != nil {
+				require.Equal(t, respData, tc.Input.Response.Data)
+			}
+		})
+	}
 }
