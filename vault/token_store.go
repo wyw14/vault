@@ -579,6 +579,39 @@ func (ts *TokenStore) paths() []*framework.Path {
 		},
 
 		{
+			Pattern: "renew-batch$",
+
+			DisplayAttrs: &framework.DisplayAttributes{
+				OperationPrefix: operationPrefixToken,
+				OperationVerb:   "renew",
+				OperationSuffix: "batch",
+			},
+
+			Fields: map[string]*framework.FieldSchema{
+				"idempotency_key": {
+					Type:        framework.TypeString,
+					Description: "Client-generated key that makes the batch renewal idempotent. Repeating a request with the same key replays the original result and never renews a token twice.",
+				},
+				"max_total_duration": {
+					Type:        framework.TypeDurationSecond,
+					Default:     0,
+					Description: "Maximum total TTL in seconds granted across the whole batch (0 means unlimited).",
+				},
+				"tokens": {
+					Type:        framework.TypeSlice,
+					Description: "List of up to 100 renewal items, each with a token or accessor and an optional increment in seconds.",
+				},
+			},
+
+			Callbacks: map[logical.Operation]framework.OperationFunc{
+				logical.UpdateOperation: ts.handleRenewBatch,
+			},
+
+			HelpSynopsis:    strings.TrimSpace(tokenRenewBatchHelp),
+			HelpDescription: strings.TrimSpace(tokenRenewBatchHelp),
+		},
+
+		{
 			Pattern: "tidy$",
 
 			DisplayAttrs: &framework.DisplayAttributes{
@@ -763,6 +796,21 @@ type TokenStore struct {
 
 	tidyLock *uint32
 
+	// renewBatchLocks serializes requests that share an idempotency key.
+	renewBatchLocks []*locksutil.LockEntry
+
+	// renewBatchNow returns the authoritative current time; tests override it
+	// to simulate clock drift between retries.
+	renewBatchNow func() time.Time
+
+	// renewBatchAuditor emits per-item audit events; tests override it to
+	// inject audit failures and recovery.
+	renewBatchAuditor renewBatchAuditorFunc
+
+	// renewBatchStorageOverride is a test-only seam that replaces the
+	// idempotency ledger storage view (e.g. to simulate barrier failures).
+	renewBatchStorageOverride logical.Storage
+
 	identityPoliciesDeriverFunc func(string) (*identity.Entity, []string, error)
 
 	quitContext context.Context
@@ -808,7 +856,10 @@ func NewTokenStore(ctx context.Context, logger log.Logger, core *Core, config *l
 		tidyLock:              new(uint32),
 		quitContext:           core.activeContext,
 		salts:                 make(map[string]*salt.Salt),
+		renewBatchLocks:       locksutil.CreateLocks(),
 	}
+	t.renewBatchNow = time.Now
+	t.renewBatchAuditor = t.defaultRenewBatchAudit
 
 	// Setup the framework endpoints
 	t.Backend = &framework.Backend{
@@ -826,6 +877,7 @@ func NewTokenStore(ctx context.Context, logger log.Logger, core *Core, config *l
 				idPrefix,
 				accessorPrefix,
 				parentPrefix,
+				renewBatchPrefix,
 				salt.DefaultLocation,
 			},
 		},
@@ -4516,6 +4568,7 @@ as revocation of tokens. The tokens are renewable if associated with a lease.`
 	tokenRevokeOrphanHelp    = `This endpoint will delete the token and orphan its child tokens.`
 	tokenRenewHelp           = `This endpoint will renew the given token and prevent expiration.`
 	tokenRenewSelfHelp       = `This endpoint will renew the token used to call it and prevent expiration.`
+	tokenRenewBatchHelp      = `This endpoint renews multiple tokens or token accessors in one request, capped by a caller supplied max_total_duration budget. Repeating a request with the same idempotency_key replays the original per-item results and never renews a token twice or expands the granted budget. Each result is reported as success, limit_reached, revoked, audit_failed, or error with a human readable reason.`
 	tokenAllowedPoliciesHelp = `If set, tokens can be created with any subset of the policies in this
 list, rather than the normal semantics of tokens being a subset of the
 calling token's policies. The parameter is a comma-delimited string of

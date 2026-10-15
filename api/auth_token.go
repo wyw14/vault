@@ -176,6 +176,36 @@ func (c *TokenAuth) RenewAccessorWithContext(ctx context.Context, accessor strin
 	return resp.toSecret()
 }
 
+// RenewBatch wraps RenewBatchWithContext using context.Background.
+func (c *TokenAuth) RenewBatch(req *TokenRenewBatchRequest) (*Secret, error) {
+	return c.RenewBatchWithContext(context.Background(), req)
+}
+
+// RenewBatchWithContext renews multiple tokens (or token accessors) in a
+// single request. MaxTotalDuration bounds the aggregate TTL in seconds
+// granted to the whole batch (0 means unlimited). The IdempotencyKey makes a
+// repeated request replay the original per-item results instead of renewing
+// the tokens a second time. The returned Secret's Data contains a "results"
+// array (one entry per input item, in order), a "summary" map of per-status
+// counts, and "granted_total_duration".
+func (c *TokenAuth) RenewBatchWithContext(ctx context.Context, req *TokenRenewBatchRequest) (*Secret, error) {
+	ctx, cancelFunc := c.c.withConfiguredTimeout(ctx)
+	defer cancelFunc()
+
+	r := c.c.NewRequest(http.MethodPut, "/v1/auth/token/renew-batch")
+	if err := r.SetJSONBody(req); err != nil {
+		return nil, err
+	}
+
+	resp, err := c.c.rawRequestWithContext(ctx, r)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	return resp.toSecret()
+}
+
 func (c *TokenAuth) Renew(token string, increment int) (*Secret, error) {
 	return c.RenewWithContext(context.Background(), token, increment)
 }
@@ -356,6 +386,21 @@ func (c *TokenAuth) RevokeTreeWithContext(ctx context.Context, token string) err
 	defer resp.Body.Close()
 
 	return nil
+}
+
+// TokenRenewBatchItem identifies a single token or accessor to renew as part
+// of a batch. Exactly one of Token and Accessor must be set.
+type TokenRenewBatchItem struct {
+	Token     string `json:"token,omitempty"`
+	Accessor  string `json:"accessor,omitempty"`
+	Increment int    `json:"increment,omitempty"`
+}
+
+// TokenRenewBatchRequest is the options structure for a batch token renewal.
+type TokenRenewBatchRequest struct {
+	IdempotencyKey   string                 `json:"idempotency_key"`
+	MaxTotalDuration int                    `json:"max_total_duration,omitempty"`
+	Tokens           []*TokenRenewBatchItem `json:"tokens"`
 }
 
 // TokenCreateRequest is the options structure for creating a token.

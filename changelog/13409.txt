@@ -1,0 +1,3 @@
+```release-note:feature
+auth/token: add `auth/token/renew-batch`, an idempotent batch token renewal endpoint that accepts a caller supplied `max_total_duration` budget, returns per-item `success`, `limit_reached`, `revoked`, `audit_failed`, or `error` results with reasons and a summary, and replays repeated requests with the same `idempotency_key` without renewing tokens twice or expanding the granted budget.
+```
