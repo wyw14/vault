@@ -19,6 +19,7 @@ import (
 	"github.com/hashicorp/vault/helper/constants"
 	"github.com/hashicorp/vault/physical/raft"
 	"github.com/hashicorp/vault/sdk/framework"
+	"github.com/hashicorp/vault/sdk/helper/jsonutil"
 	"github.com/hashicorp/vault/sdk/logical"
 	"github.com/hashicorp/vault/sdk/physical"
 	"github.com/hashicorp/vault/vault/seal"
@@ -166,6 +167,70 @@ func (b *SystemBackend) raftStoragePaths() []*framework.Path {
 			HelpDescription: strings.TrimSpace(sysRaftHelp["raft-snapshot-force"][1]),
 		},
 		{
+			Pattern: "storage/raft/recovery/drill",
+
+			Fields: map[string]*framework.FieldSchema{
+				"drill_id": {
+					Type:        framework.TypeString,
+					Description: "ID of the recovery drill to query.",
+				},
+				"peers": {
+					Type:        framework.TypeSlice,
+					Description: "Optional peer set that a real recovery would use, as a list of objects with id, address and suffrage fields. When omitted, the current raft configuration is used.",
+				},
+				"probe_attempts": {
+					Type:        framework.TypeInt,
+					Description: "Number of reachability attempts per peer, allowing the drill to tolerate network jitter. Defaults to 3.",
+				},
+				"probe_timeout_seconds": {
+					Type:        framework.TypeInt,
+					Description: "Timeout for a single peer probe attempt, in seconds. Defaults to 2.",
+				},
+				"probe_backoff_ms": {
+					Type:        framework.TypeInt,
+					Description: "Backoff between peer probe attempts, in milliseconds. Defaults to 200.",
+				},
+				"phase_delay_ms": {
+					Type:        framework.TypeInt,
+					Description: "Interruptible delay inserted before each drill phase, in milliseconds.",
+				},
+			},
+
+			Operations: map[logical.Operation]framework.OperationHandler{
+				logical.ReadOperation: &framework.PathOperation{
+					Callback: b.handleRaftRecoveryDrillStatus(),
+					Summary:  "Returns the state of a read-only raft recovery drill, including per-phase blocking reasons and resumable checkpoints.",
+				},
+				logical.UpdateOperation: &framework.PathOperation{
+					Callback: b.handleRaftRecoveryDrillStart(),
+					Summary:  "Starts a read-only raft recovery drill that simulates snapshot verification, peer list reconstruction and node restart without changing cluster membership.",
+				},
+			},
+
+			HelpSynopsis:    strings.TrimSpace(sysRaftHelp["raft-recovery-drill"][0]),
+			HelpDescription: strings.TrimSpace(sysRaftHelp["raft-recovery-drill"][1]),
+		},
+		{
+			Pattern: "storage/raft/recovery/drill/cancel",
+
+			Fields: map[string]*framework.FieldSchema{
+				"drill_id": {
+					Type:        framework.TypeString,
+					Description: "ID of the recovery drill to cancel.",
+				},
+			},
+
+			Operations: map[logical.Operation]framework.OperationHandler{
+				logical.UpdateOperation: &framework.PathOperation{
+					Callback: b.handleRaftRecoveryDrillCancel(),
+					Summary:  "Cancels a running read-only raft recovery drill at its current checkpoint.",
+				},
+			},
+
+			HelpSynopsis:    strings.TrimSpace(sysRaftHelp["raft-recovery-drill-cancel"][0]),
+			HelpDescription: strings.TrimSpace(sysRaftHelp["raft-recovery-drill-cancel"][1]),
+		},
+		{
 			Pattern: "storage/raft/autopilot/state",
 			Operations: map[logical.Operation]framework.OperationHandler{
 				logical.ReadOperation: &framework.PathOperation{
@@ -277,6 +342,111 @@ func (b *SystemBackend) handleRaftRemovePeerUpdate() framework.OperationFunc {
 
 		return nil, nil
 	}
+}
+
+// handleRaftRecoveryDrillStart starts a read-only recovery drill. The drill
+// simulates snapshot verification, peer list reconstruction and a node
+// restart, but it never changes cluster membership and never performs a
+// recovery: the response always reports that explicit confirmation is
+// required for an actual recovery.
+func (b *SystemBackend) handleRaftRecoveryDrillStart() framework.OperationFunc {
+	return func(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+		raftBackend := b.Core.getRaftBackend()
+		if raftBackend == nil {
+			return logical.ErrorResponse("raft storage is not in use"), logical.ErrInvalidRequest
+		}
+
+		opts := raft.RecoveryDrillOpts{
+			ProbeAttempts: d.Get("probe_attempts").(int),
+		}
+		if seconds := d.Get("probe_timeout_seconds").(int); seconds > 0 {
+			opts.ProbeTimeout = time.Duration(seconds) * time.Second
+		}
+		if ms := d.Get("probe_backoff_ms").(int); ms > 0 {
+			opts.ProbeBackoff = time.Duration(ms) * time.Millisecond
+		}
+		if ms := d.Get("phase_delay_ms").(int); ms > 0 {
+			opts.PhaseDelay = time.Duration(ms) * time.Millisecond
+		}
+
+		// The peers field is an opaque slice; round-trip it through JSON to
+		// decode the peer objects supplied by the operator.
+		if raw, ok := d.Get("peers").([]interface{}); ok && len(raw) > 0 {
+			buf, err := jsonutil.EncodeJSON(raw)
+			if err != nil {
+				return logical.ErrorResponse("failed to encode peers field: %v", err), logical.ErrInvalidRequest
+			}
+			var peers []raft.Peer
+			if err := jsonutil.DecodeJSON(buf, &peers); err != nil {
+				return logical.ErrorResponse("invalid peers payload: %v", err), logical.ErrInvalidRequest
+			}
+			opts.IntendedPeers = peers
+		}
+
+		state, err := raftBackend.StartRecoveryDrill(ctx, opts)
+		if err != nil {
+			return nil, err
+		}
+
+		return raftRecoveryDrillResponse(state)
+	}
+}
+
+// handleRaftRecoveryDrillStatus returns the state of the most recent drill.
+func (b *SystemBackend) handleRaftRecoveryDrillStatus() framework.OperationFunc {
+	return func(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+		raftBackend := b.Core.getRaftBackend()
+		if raftBackend == nil {
+			return logical.ErrorResponse("raft storage is not in use"), logical.ErrInvalidRequest
+		}
+
+		state, err := raftBackend.RecoveryDrillStatus(d.Get("drill_id").(string))
+		if errors.Is(err, raft.ErrRecoveryDrillNotFound) {
+			return logical.ErrorResponse("no raft recovery drill found"), logical.ErrInvalidRequest
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		return raftRecoveryDrillResponse(state)
+	}
+}
+
+// handleRaftRecoveryDrillCancel cancels the running drill and returns the
+// state at the checkpoint where it stopped.
+func (b *SystemBackend) handleRaftRecoveryDrillCancel() framework.OperationFunc {
+	return func(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+		raftBackend := b.Core.getRaftBackend()
+		if raftBackend == nil {
+			return logical.ErrorResponse("raft storage is not in use"), logical.ErrInvalidRequest
+		}
+
+		state, err := raftBackend.CancelRecoveryDrill(d.Get("drill_id").(string))
+		switch {
+		case errors.Is(err, raft.ErrRecoveryDrillNotFound):
+			return logical.ErrorResponse("no raft recovery drill found"), logical.ErrInvalidRequest
+		case errors.Is(err, raft.ErrRecoveryDrillNotActive):
+			return raftRecoveryDrillResponse(state)
+		case err != nil:
+			return nil, err
+		}
+
+		return raftRecoveryDrillResponse(state)
+	}
+}
+
+// raftRecoveryDrillResponse flattens a drill state (JSON tagged) into a
+// logical response data map.
+func raftRecoveryDrillResponse(state *raft.RecoveryDrillState) (*logical.Response, error) {
+	buf, err := jsonutil.EncodeJSON(state)
+	if err != nil {
+		return nil, err
+	}
+	var data map[string]interface{}
+	if err := jsonutil.DecodeJSON(buf, &data); err != nil {
+		return nil, err
+	}
+	return &logical.Response{Data: data}, nil
 }
 
 const answerSize = 16
@@ -755,6 +925,20 @@ var sysRaftHelp = map[string][2]string{
 	"raft-autopilot-configuration": {
 		"Returns autopilot configuration.",
 		"",
+	},
+	"raft-recovery-drill": {
+		"Runs a read-only raft recovery drill.",
+		`The drill simulates snapshot verification, peer list reconstruction and a
+		node restart without changing cluster membership, taking snapshots or
+		writing a peers.json file. Each phase reports blocking reasons and a
+		resumable checkpoint. A drill never performs a recovery; recovering the
+		raft cluster still requires an explicit, out-of-band confirmation.
+		Network probes are retried so transient jitter is tolerated.`,
+	},
+	"raft-recovery-drill-cancel": {
+		"Cancels a running read-only raft recovery drill.",
+		`The drill stops at the current phase checkpoint and subsequent phases are
+		marked as skipped. A new drill can be started afterwards.`,
 	},
 }
 

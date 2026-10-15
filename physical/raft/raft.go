@@ -261,6 +261,12 @@ type RaftBackend struct {
 	removed              *atomic.Bool
 	removedCallback      func()
 	removedServerCleanup func(context.Context, string) (bool, error)
+
+	// drillMu guards drill/drillPrevious, which hold the most recent and the
+	// previous read-only recovery drills. Only one drill runs at a time.
+	drillMu       sync.Mutex
+	drill         *recoveryDrillRun
+	drillPrevious *recoveryDrillRun
 }
 
 func (b *RaftBackend) IsNodeRemoved(ctx context.Context, nodeID string) (bool, error) {
@@ -709,6 +715,9 @@ func newSnapshotStoreDelay(snap raft.SnapshotStore, delay time.Duration, logger 
 // should only be called if you are sure the RaftBackend will never be used
 // again.
 func (b *RaftBackend) Close() error {
+	// Stop any in-flight read-only recovery drill before tearing down stores.
+	b.cancelActiveRecoveryDrill()
+
 	b.l.Lock()
 	defer b.l.Unlock()
 

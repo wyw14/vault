@@ -516,6 +516,103 @@ func (c *Sys) RaftForceUnloadSnapshotWithContext(ctx context.Context, snapID str
 	return c.raftUnloadSnapshotWithContext(ctx, snapID, true)
 }
 
+// RaftRecoveryDrillPeer describes a single peer in the simulated recovery
+// plan of a raft recovery drill.
+type RaftRecoveryDrillPeer struct {
+	ID       string `json:"id"`
+	Address  string `json:"address"`
+	Suffrage int    `json:"suffrage,omitempty"`
+}
+
+// RaftRecoveryDrillRequest is the payload used to start a read-only raft
+// recovery drill.
+type RaftRecoveryDrillRequest struct {
+	Peers               []RaftRecoveryDrillPeer `json:"peers,omitempty"`
+	ProbeAttempts       int                     `json:"probe_attempts,omitempty"`
+	ProbeTimeoutSeconds int                     `json:"probe_timeout_seconds,omitempty"`
+	ProbeBackoffMs      int                     `json:"probe_backoff_ms,omitempty"`
+	PhaseDelayMs        int                     `json:"phase_delay_ms,omitempty"`
+}
+
+// RaftRecoveryDrill wraps RaftRecoveryDrillWithContext using context.Background.
+func (c *Sys) RaftRecoveryDrill(opts *RaftRecoveryDrillRequest) (*Secret, error) {
+	return c.RaftRecoveryDrillWithContext(context.Background(), opts)
+}
+
+// RaftRecoveryDrillWithContext starts a read-only raft recovery drill. The
+// drill simulates snapshot verification, peer list reconstruction and a node
+// restart without changing cluster membership; an actual recovery still
+// requires explicit, out-of-band confirmation.
+func (c *Sys) RaftRecoveryDrillWithContext(ctx context.Context, opts *RaftRecoveryDrillRequest) (*Secret, error) {
+	ctx, cancelFunc := c.c.withConfiguredTimeout(ctx)
+	defer cancelFunc()
+
+	r := c.c.NewRequest(http.MethodPost, "/v1/sys/storage/raft/recovery/drill")
+	if err := r.SetJSONBody(opts); err != nil {
+		return nil, err
+	}
+
+	resp, err := c.c.rawRequestWithContext(ctx, r)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	return ParseSecret(resp.Body)
+}
+
+// RaftRecoveryDrillStatus wraps RaftRecoveryDrillStatusWithContext using context.Background.
+func (c *Sys) RaftRecoveryDrillStatus(drillID string) (*Secret, error) {
+	return c.RaftRecoveryDrillStatusWithContext(context.Background(), drillID)
+}
+
+// RaftRecoveryDrillStatusWithContext returns the state of the most recent
+// raft recovery drill, or the drill identified by drillID when supplied.
+func (c *Sys) RaftRecoveryDrillStatusWithContext(ctx context.Context, drillID string) (*Secret, error) {
+	ctx, cancelFunc := c.c.withConfiguredTimeout(ctx)
+	defer cancelFunc()
+
+	r := c.c.NewRequest(http.MethodGet, "/v1/sys/storage/raft/recovery/drill")
+	if drillID != "" {
+		r.Params.Set("drill_id", drillID)
+	}
+
+	resp, err := c.c.rawRequestWithContext(ctx, r)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	return ParseSecret(resp.Body)
+}
+
+// RaftRecoveryDrillCancel wraps RaftRecoveryDrillCancelWithContext using context.Background.
+func (c *Sys) RaftRecoveryDrillCancel(drillID string) (*Secret, error) {
+	return c.RaftRecoveryDrillCancelWithContext(context.Background(), drillID)
+}
+
+// RaftRecoveryDrillCancelWithContext cancels a running read-only raft
+// recovery drill and returns the state at its current checkpoint.
+func (c *Sys) RaftRecoveryDrillCancelWithContext(ctx context.Context, drillID string) (*Secret, error) {
+	ctx, cancelFunc := c.c.withConfiguredTimeout(ctx)
+	defer cancelFunc()
+
+	r := c.c.NewRequest(http.MethodPost, "/v1/sys/storage/raft/recovery/drill/cancel")
+	if err := r.SetJSONBody(map[string]interface{}{
+		"drill_id": drillID,
+	}); err != nil {
+		return nil, err
+	}
+
+	resp, err := c.c.rawRequestWithContext(ctx, r)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	return ParseSecret(resp.Body)
+}
+
 func (c *Sys) raftUnloadSnapshotWithContext(ctx context.Context, snapID string, force bool) (*Secret, error) {
 	ctx, cancelFunc := c.c.withConfiguredTimeout(ctx)
 	defer cancelFunc()
