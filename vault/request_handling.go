@@ -2056,6 +2056,14 @@ func (c *Core) normalizeCaseInsensitiveResourcePath(path string, entry *MountEnt
 	return path
 }
 
+// Login failure injection stages used by the test-only
+// Core.testLoginFailureHook. Production code never sets the hook.
+const (
+	loginStageEntityMapping     = "entity_mapping"
+	loginStageMFAChallenge      = "mfa_challenge"
+	loginStagePostTokenCreation = "post_token_creation"
+)
+
 // handleLoginRequest is used to handle a login request, which is an
 // unauthenticated request to the backend.
 func (c *Core) handleLoginRequest(ctx context.Context, req *logical.Request) (retResp *logical.Response, retAuth *logical.Auth, retErr error) {
@@ -2301,6 +2309,18 @@ func (c *Core) handleLoginRequest(ctx context.Context, req *logical.Request) (re
 			return
 		}
 
+		// Safety net: the credentials were accepted by the auth backend, but
+		// if the login ultimately fails after a renewable service token (and
+		// its lease) was registered, the half-created token must not outlive
+		// the failed attempt. This is registered before the quota
+		// acknowledgement below (defers run LIFO), so leaseGenerated remains
+		// available for the quota ack.
+		defer func() {
+			if retErr != nil {
+				c.revokeHalfCreatedLoginToken(ctx, req.Path, leaseGenerated, auth)
+			}
+		}()
+
 		defer func() {
 			if quotaResp.Access != nil {
 				quotaAckErr := c.ackLeaseQuota(quotaResp.Access, leaseGenerated)
@@ -2330,14 +2350,23 @@ func (c *Core) handleLoginRequest(ctx context.Context, req *logical.Request) (re
 			auth.Alias.Local = mEntry.Local
 
 			if auth.Alias.Name == "" {
-				return nil, nil, fmt.Errorf("missing name in alias")
+				// The backend validated the credentials but did not supply a
+				// usable identity alias; deny the login consistently with a
+				// disabled entity and a failed MFA challenge.
+				return nil, nil, logical.ErrPermissionDenied
 			}
 
-			var err error
 			// Fetch the entity for the alias, or create an entity if one
 			// doesn't exist.
-
 			entity, entityCreated, err := c.identityStore.CreateOrFetchEntity(ctx, auth.Alias)
+			if c.testLoginFailureHook != nil {
+				// Test-only injection point for an entity/role mapping or
+				// mount accessor failure.
+				if hookErr := c.testLoginFailureHook(loginStageEntityMapping, req); hookErr != nil {
+					entity = nil
+					err = hookErr
+				}
+			}
 			if err != nil {
 				switch auth.Alias.Local {
 				case true:
@@ -2349,21 +2378,31 @@ func (c *Core) handleLoginRequest(ctx context.Context, req *logical.Request) (re
 							if strings.Contains(err.Error(), errCreateEntityUnimplemented) {
 								resp.AddWarning("primary cluster doesn't yet issue entities for local auth mounts; falling back to not issuing entities for local auth mounts")
 								goto CREATE_TOKEN
-							} else {
-								return nil, nil, err
 							}
 						}
 					}
 				default:
 					entity, entityCreated, err = possiblyForwardAliasCreation(ctx, c, err, auth, entity)
-					if err != nil {
-						return nil, nil, err
-					}
 				}
 			}
 
+			if err != nil {
+				// Alias and mount accessor validation failures (nil/empty
+				// alias, unknown mount accessor, mount type mismatch)
+				// describe an unusable authentication context rather than a
+				// storage fault. Return the same permission-denied result as
+				// a disabled entity or a failed MFA challenge. Genuine
+				// infrastructure errors (including read-only errors that may
+				// be forwarded to the primary) keep their original error so
+				// they remain retryable.
+				if errors.Is(err, logical.ErrPermissionDenied) {
+					return nil, nil, logical.ErrPermissionDenied
+				}
+				return nil, nil, err
+			}
+
 			if entity == nil {
-				return nil, nil, fmt.Errorf("failed to create an entity for the authenticated alias")
+				return nil, nil, logical.ErrPermissionDenied
 			}
 
 			if entity.Disabled {
@@ -2413,6 +2452,14 @@ func (c *Core) handleLoginRequest(ctx context.Context, req *logical.Request) (re
 		// This is why, the MFA check is placed at this point. The resp.Auth is going to be fully cached
 		// in memory so that it would be used to return to the user upon MFA validation is completed.
 		if entity != nil {
+			if c.testLoginFailureHook != nil {
+				// Test-only injection point for a failed MFA challenge. It is
+				// placed exactly where a single-phase MFA challenge would fail
+				// the login, so the result matches a real challenge failure.
+				if hookErr := c.testLoginFailureHook(loginStageMFAChallenge, req); hookErr != nil {
+					return nil, nil, hookErr
+				}
+			}
 			if len(matchedMfaEnforcementList) == 0 && len(req.MFACreds) > 0 {
 				resp.AddWarning("Found MFA header but failed to find MFA Enforcement Config")
 			}
@@ -2495,6 +2542,16 @@ func (c *Core) handleLoginRequest(ctx context.Context, req *logical.Request) (re
 			return respTokenCreate, nil, errCreateToken
 		}
 		resp = respTokenCreate
+
+		if c.testLoginFailureHook != nil {
+			// Test-only injection point for a failure after the renewable
+			// service token (and its lease) was registered. The deferred
+			// safety net above must revoke the half-created token so the
+			// failed attempt cannot leave a renewable token behind.
+			if hookErr := c.testLoginFailureHook(loginStagePostTokenCreation, req); hookErr != nil {
+				return nil, nil, hookErr
+			}
+		}
 	}
 
 	// Successful login, remove any entry from userFailedLoginInfo map
@@ -2503,7 +2560,7 @@ func (c *Core) handleLoginRequest(ctx context.Context, req *logical.Request) (re
 	// For service tokens on ent it is taken care by registerAuth RPC calls.
 	// This update is done as part of registerAuth of RPC calls from standby
 	// to active node. This is added there to reduce RPC calls
-	if !isUserLockoutDisabled && (auth.TokenType == logical.TokenTypeBatch) {
+	if !isUserLockoutDisabled && auth.TokenType == logical.TokenTypeBatch && auth.Alias != nil {
 		loginUserInfoKey := FailedLoginUser{
 			aliasName:     auth.Alias.Name,
 			mountAccessor: auth.Alias.MountAccessor,
@@ -2652,6 +2709,30 @@ func (c *Core) handleDelegatedAuth(ctx context.Context, origReq *logical.Request
 	secondReq.ClientTokenSource = logical.ClientTokenFromInternalAuth
 	resp, err := c.handleCancelableRequest(ctx, secondReq)
 	return resp, nil, err
+}
+
+// revokeHalfCreatedLoginToken revokes the service token (and its registered
+// lease) produced by a login attempt that is going to fail, so the failed
+// attempt cannot leave behind a renewable half-created token. leaseGenerated
+// must reflect whether LoginCreateToken registered a service token lease. It
+// is a no-op for batch tokens or empty tokens.
+func (c *Core) revokeHalfCreatedLoginToken(ctx context.Context, reqPath string, leaseGenerated bool, auth *logical.Auth) {
+	if !leaseGenerated || auth == nil || auth.ClientToken == "" {
+		return
+	}
+	// auth.ClientToken may be the external (SSC) representation; look the
+	// entry up first so revocation uses the internal token ID the token store
+	// indexed the entry (and its lease) under.
+	te, lookupErr := c.tokenStore.Lookup(ctx, auth.ClientToken)
+	if lookupErr != nil || te == nil {
+		c.logger.Error("failed to look up token while cleaning up failed login request", "request_path", reqPath, "error", lookupErr)
+		return
+	}
+	if revokeErr := c.tokenStore.revokeOrphan(ctx, te.ID); revokeErr != nil {
+		c.logger.Error("failed to revoke token after failed login request", "request_path", reqPath, "error", revokeErr)
+		return
+	}
+	c.logger.Warn("revoked token after failed login request", "request_path", reqPath)
 }
 
 // LoginCreateToken creates a token as a result of a login request.

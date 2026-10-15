@@ -882,6 +882,19 @@ func (c *Core) LoginMFACreateToken(ctx context.Context, reqPath string, cachedAu
 		}
 	}
 
+	if err != nil {
+		// The MFA challenge passed and a service token may already have been
+		// registered, but the login cannot complete. Revoke the half-created
+		// token (and its lease) so the failed attempt cannot leave a renewable
+		// token behind. The cached MFA auth entry is pushed back by the
+		// caller's deferred handler, allowing the client to retry.
+		var failedAuth *logical.Auth
+		if resp != nil {
+			failedAuth = resp.Auth
+		}
+		c.revokeHalfCreatedLoginToken(ctx, reqPath, leaseGenerated, failedAuth)
+	}
+
 	return resp, err
 }
 

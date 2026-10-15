@@ -778,6 +778,14 @@ type Core struct {
 	// for testing purposes
 	requestResponseCallback func(logical.Backend, *logical.Request, *logical.Response)
 
+	// testLoginFailureHook is used ONLY by tests to simulate failures at
+	// well-defined stages of a login request after the credentials were
+	// validated (entity/role mapping, the MFA challenge, or bookkeeping
+	// immediately after token creation). It is nil outside of tests, so it
+	// has no effect on production request handling. Returning an error fails
+	// the login at that stage.
+	testLoginFailureHook func(stage string, req *logical.Request) error
+
 	// If any role based quota (LCQ or RLQ) is enabled, don't track lease counts by role
 	impreciseLeaseRoleTracking bool
 

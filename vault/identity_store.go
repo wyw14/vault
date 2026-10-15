@@ -1510,21 +1510,26 @@ func (i *IdentityStore) CreateOrFetchEntity(ctx context.Context, alias *logical.
 	var update bool
 	var entityCreated bool
 
+	// The following failures describe an unusable authentication context
+	// rather than a storage/infrastructure fault. Wrap them with
+	// logical.ErrPermissionDenied so that login entry points can return a
+	// consistent, non-retryable authentication failure (matching entity
+	// disabled and MFA challenge failures) instead of an opaque 500.
 	if alias == nil {
-		return nil, false, fmt.Errorf("alias is nil")
+		return nil, false, fmt.Errorf("%w: alias is nil", logical.ErrPermissionDenied)
 	}
 
 	if alias.Name == "" {
-		return nil, false, fmt.Errorf("empty alias name")
+		return nil, false, fmt.Errorf("%w: empty alias name", logical.ErrPermissionDenied)
 	}
 
 	mountValidationResp := i.router.ValidateMountByAccessor(alias.MountAccessor)
 	if mountValidationResp == nil {
-		return nil, false, fmt.Errorf("invalid mount accessor %q", alias.MountAccessor)
+		return nil, false, fmt.Errorf("%w: invalid mount accessor %q", logical.ErrPermissionDenied, alias.MountAccessor)
 	}
 
 	if mountValidationResp.MountType != alias.MountType {
-		return nil, false, fmt.Errorf("mount accessor %q is not a mount of type %q", alias.MountAccessor, alias.MountType)
+		return nil, false, fmt.Errorf("%w: mount accessor %q is not a mount of type %q", logical.ErrPermissionDenied, alias.MountAccessor, alias.MountType)
 	}
 
 	// Fast path: only clone and return the entity when alias metadata is unchanged.
